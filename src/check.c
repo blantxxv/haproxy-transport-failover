@@ -57,6 +57,7 @@
 #include <haproxy/resolvers.h>
 #include <haproxy/sample.h>
 #include <haproxy/server.h>
+#include <haproxy/server_tf.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/task.h>
 #include <haproxy/tcpcheck.h>
@@ -500,6 +501,15 @@ void set_server_check_status(struct check *check, short status, const char *desc
 	if (!s)
 	    return;
 
+	/* The server's own health check is also what probes the primary
+	 * transport when transport failover is configured, so report every
+	 * result, including those which do not change the check's health.
+	 */
+	if (!(check->state & CHK_ST_AGENT) && (s->flags & SRV_F_TF_ENABLED) &&
+	    (check->result == CHK_RES_FAILED || check->result == CHK_RES_PASSED ||
+	     check->result == CHK_RES_CONDPASS))
+		srv_tf_report_check(s, check->result != CHK_RES_FAILED);
+
 	switch (check->result) {
 	case CHK_RES_FAILED:
 		/* Failure to connect to the agent as a secondary check should not
@@ -588,6 +598,17 @@ void check_notify_failure(struct check *check)
 
 	if (check->health > 0)
 		return;
+
+	/* The primary transport is confirmed dead by the health check. If a
+	 * fallback transport is available, the server keeps serving new
+	 * connections over it instead of being marked down, and this check
+	 * becomes the primary transport prober.
+	 */
+	if (srv_tf_absorb_check_failure(s)) {
+		TRACE_STATE("health-check failed, server kept up on its fallback transport",
+		            CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check);
+		return;
+	}
 
 	TRACE_STATE("health-check failed, set server DOWN", CHK_EV_HCHK_END|CHK_EV_HCHK_ERR, check);
 	srv_set_stopped(s, check_notify_cause(check));
