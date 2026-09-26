@@ -439,9 +439,12 @@ void srv_tf_report_check(struct server *srv, int passed)
 	 */
 	if (srv->tf.hold &&
 	    !tick_is_expired(tick_add(HA_ATOMIC_LOAD(&srv->tf.fb_since), srv->tf.hold), now_ms)) {
-		srv_tf_log(srv, LOG_INFO,
-		           "primary transport probe successful %u/%d, waiting for hold-down to expire",
-		           rise, srv->tf.rise_thres);
+		/* report it once, not on every probe until the delay expires */
+		if (rise == (uint)srv->tf.rise_thres)
+			srv_tf_log(srv, LOG_INFO,
+			           "primary transport probe successful %u/%d, waiting for "
+			           "the hold-down delay to expire",
+			           rise, srv->tf.rise_thres);
 		return;
 	}
 

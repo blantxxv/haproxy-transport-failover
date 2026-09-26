@@ -18926,8 +18926,10 @@ fallback-transport [<backend>/]<server>
 
   Existing connections are never migrated from one transport to the other:
   TCP and QUIC do not share the same semantics. Sessions running on the
-  primary transport when it breaks fail as usual, possibly retried according
-  to "retries", and only new connections use the other transport.
+  primary transport when it breaks fail as usual and only new connections use
+  the other transport. A connection retry performed for such a session
+  according to "retries" counts as a new connection though, so a session whose
+  first attempt is what triggered the switch is usually saved by its own retry.
 
   If the fallback transport also becomes unusable, the server stops absorbing
   its health check failures and ends up being marked down as it would be
