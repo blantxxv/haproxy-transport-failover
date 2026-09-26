@@ -1,0 +1,85 @@
+varnishtest "Server transport failover between a primary and a fallback transport"
+#REGTEST_TYPE=slow
+feature ignore_unknown_macro
+
+# The primary transport of be_main/srv points at a port nothing listens on, so
+# both its health check and its connections fail, and the traffic must be
+# directed to the fallback transport. That fallback transport is an ordinary
+# server in be_fallback, which is the only one able to answer, and this is how
+# the test tells both transports apart. The state machine is then inspected on
+# the CLI.
+#
+# The fallback transport is plain TCP here since QUIC would require a TLS setup
+# which is out of the scope of a reg-test. The transport selection code does not
+# care about which transport it is: it targets the connection at the fallback
+# server, whose own settings then apply.
+
+syslog S -level warning {
+    recv
+    expect ~ "Server be_main/srv transport: primary transport declared unusable by its health check, switching to fallback transport be_fallback/srv"
+} -start
+
+server s1 {
+    rxreq
+    txresp -hdr "x-served-by: fallback"
+} -start
+
+haproxy h1 -conf {
+    global
+    .if feature(THREAD)
+        thread-groups 1
+    .endif
+
+    defaults
+        mode http
+        timeout client "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout server "${HAPROXY_TEST_TIMEOUT-5s}"
+        timeout connect "1s"
+        retries 1
+
+    frontend fe
+        bind "fd@${fe}"
+        default_backend be_main
+
+    backend be_fallback
+        server srv ${s1_addr}:${s1_port}
+
+    backend be_main
+        log ${S_addr}:${S_port} daemon
+        # port 1 cannot be bound by an unprivileged process and nothing listens
+        # there, so this primary transport is broken from the start
+        server srv ${s1_addr}:1 check inter 100ms fall 2 rise 1 fallback-transport be_fallback/srv transport-fall 2 transport-rise 2 transport-probe 100ms transport-hold 100ms
+} -start
+
+# the syslog message above is only emitted once the transport switch happened
+syslog S -wait
+
+client c1 -connect ${h1_fe_sock} {
+    txreq -url "/"
+    rxresp
+    expect resp.status == 200
+    expect resp.http.x-served-by == "fallback"
+} -run
+
+haproxy h1 -cli {
+    # The server must still be considered usable: it was not marked down even
+    # though its own health check keeps failing, which shows up as "UP 0/2".
+    send "show stat"
+    expect ~ "be_main,srv,.*,UP 0/2,"
+    send "show stat"
+    expect ~ "be_main,srv,.*,fallback,FALLBACK_ACTIVE,1,1,1,"
+
+    # the state machine must report the fallback transport as being used
+    send "show servers transport be_main"
+    expect ~ "be_main/srv .* state=FALLBACK_ACTIVE current=fallback primary=down fallback=be_fallback/srv:up"
+    send "show servers transport be_main"
+    expect ~ "switches=1 "
+    send "show servers transport be_main"
+    expect ~ "reason=health check"
+
+    # servers without a fallback transport are not listed
+    send "show servers transport be_fallback"
+    expect !~ "be_fallback/srv"
+}
+
+server s1 -wait

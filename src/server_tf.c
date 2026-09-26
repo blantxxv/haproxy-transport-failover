@@ -22,6 +22,8 @@
  * feature is entirely hidden behind the SRV_F_TF_ENABLED flag test.
  */
 
+#include <stdio.h>
+
 #include <haproxy/api.h>
 #include <haproxy/atomic.h>
 #include <haproxy/backend.h>
@@ -30,6 +32,8 @@
 #include <haproxy/clock.h>
 #include <haproxy/connection.h>
 #include <haproxy/errors.h>
+#include <haproxy/global.h>
+#include <haproxy/init.h>
 #include <haproxy/log.h>
 #include <haproxy/proxy.h>
 #include <haproxy/server.h>
@@ -125,7 +129,11 @@ static int srv_tf_fb_usable(struct server *srv)
 	if (fails >= (uint)srv->tf.fall_thres) {
 		uint since = HA_ATOMIC_LOAD(&srv->tf.fb_fail_since);
 
-		if (!tick_is_expired(tick_add(since, srv->tf.hold), now_ms))
+		/* a null hold-down delay means the fallback transport may be
+		 * retried immediately
+		 */
+		if (srv->tf.hold &&
+		    !tick_is_expired(tick_add(since, srv->tf.hold), now_ms))
 			return 0;
 
 		/* give the fallback transport another chance */
@@ -165,6 +173,11 @@ static void srv_tf_go_fallback(struct server *srv, uint reason)
 		           "switching to fallback transport %s/%s",
 		           srv_tf_reason_str(reason),
 		           srv->tf.fb_srv->proxy->id, srv->tf.fb_srv->id);
+
+	/* the failure counter did its job, restart it so that it keeps
+	 * reflecting what is currently observed on the primary transport
+	 */
+	HA_ATOMIC_STORE(&srv->tf.fail, 0);
 
 	/* the primary transport is now probed at its own pace, make the check
 	 * task recompute its timer right away.
@@ -420,10 +433,12 @@ void srv_tf_report_check(struct server *srv, int passed)
 		return;
 	}
 
-	/* enough successful probes: honour the hold-down delay before moving
-	 * the traffic back, this is what prevents flapping.
+	/* Enough successful probes: honour the hold-down delay before moving
+	 * the traffic back, this is what prevents flapping. A null delay means
+	 * the traffic may move back as soon as the probes succeeded.
 	 */
-	if (!tick_is_expired(tick_add(HA_ATOMIC_LOAD(&srv->tf.fb_since), srv->tf.hold), now_ms)) {
+	if (srv->tf.hold &&
+	    !tick_is_expired(tick_add(HA_ATOMIC_LOAD(&srv->tf.fb_since), srv->tf.hold), now_ms)) {
 		srv_tf_log(srv, LOG_INFO,
 		           "primary transport probe successful %u/%d, waiting for hold-down to expire",
 		           rise, srv->tf.rise_thres);
@@ -612,3 +627,391 @@ int srv_tf_dump(struct buffer *buf, const struct server *srv)
 
 	return 1;
 }
+
+#ifdef DEBUG_UNIT
+
+/* Unit tests of the transport failover state machine. They work on a pair of
+ * fake servers so that the state machine can be driven event by event, which
+ * is not easily reproducible with a live setup. Run with:
+ *     ./haproxy -U srv_tf
+ */
+
+#include <pthread.h>
+
+static struct proxy tf_ut_px;
+static struct proxy tf_ut_fbpx;
+static struct server tf_ut_srv;
+static struct server tf_ut_fb;
+
+static int tf_ut_errors;
+
+#define TF_UT_CHECK(cond)						\
+	do {								\
+		if (!(cond)) {						\
+			fprintf(stderr, "  FAIL %s:%d: %s\n",		\
+			        __func__, __LINE__, #cond);		\
+			tf_ut_errors++;					\
+		}							\
+	} while (0)
+
+/* rebuilds a pristine primary + fallback server pair */
+static void tf_ut_reset(void)
+{
+	memset(&tf_ut_px, 0, sizeof(tf_ut_px));
+	memset(&tf_ut_fbpx, 0, sizeof(tf_ut_fbpx));
+	memset(&tf_ut_srv, 0, sizeof(tf_ut_srv));
+	memset(&tf_ut_fb, 0, sizeof(tf_ut_fb));
+
+	tf_ut_px.id = "be-primary";
+	tf_ut_fbpx.id = "be-fallback";
+
+	tf_ut_srv.obj_type = OBJ_TYPE_SERVER;
+	tf_ut_srv.id = "s1";
+	tf_ut_srv.proxy = &tf_ut_px;
+	tf_ut_srv.flags = SRV_F_TF_ENABLED;
+
+	tf_ut_fb.obj_type = OBJ_TYPE_SERVER;
+	tf_ut_fb.id = "s1";
+	tf_ut_fb.proxy = &tf_ut_fbpx;
+	tf_ut_fb.flags = SRV_F_TF_FALLBACK;
+	/* make the fallback server usable */
+	tf_ut_fb.cur_state = tf_ut_fb.next_state = SRV_ST_RUNNING;
+	tf_ut_fb.cur_eweight = tf_ut_fb.next_eweight = 1;
+
+	srv_tf_set_defaults(&tf_ut_srv.tf);
+	tf_ut_srv.tf.fb_srv = &tf_ut_fb;
+	tf_ut_srv.tf.state = SRV_TF_ST_PRIMARY;
+}
+
+/* the defaults must match what is documented */
+static void tf_ut_defaults(void)
+{
+	struct srv_tf tf;
+
+	memset(&tf, 0, sizeof(tf));
+	srv_tf_set_defaults(&tf);
+	TF_UT_CHECK(tf.fall_thres == 3);
+	TF_UT_CHECK(tf.rise_thres == 5);
+	TF_UT_CHECK(tf.probe == 5000);
+	TF_UT_CHECK(tf.hold == 30000);
+}
+
+/* consecutive data plane failures must move the traffic to the fallback
+ * transport, but only once the threshold is reached
+ */
+static void tf_ut_fall_counter(void)
+{
+	int i;
+
+	tf_ut_reset();
+	tf_ut_srv.tf.fall_thres = 3;
+
+	for (i = 0; i < 2; i++) {
+		srv_tf_report_conn_err(&tf_ut_srv, &tf_ut_srv, SRV_TF_ERR_TRANSP);
+		TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_DEGRADED);
+		TF_UT_CHECK(srv_tf_endpoint(&tf_ut_srv) == &tf_ut_srv);
+	}
+	TF_UT_CHECK(tf_ut_srv.tf.fail == 2);
+
+	srv_tf_report_conn_err(&tf_ut_srv, &tf_ut_srv, SRV_TF_ERR_TRANSP);
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_FALLBACK);
+	TF_UT_CHECK(tf_ut_srv.tf.switches == 1);
+	TF_UT_CHECK(srv_tf_endpoint(&tf_ut_srv) == &tf_ut_fb);
+	TF_UT_CHECK(tf_ut_srv.tf.fb_conns == 1);
+
+	/* a local failure must never be counted */
+	tf_ut_reset();
+	for (i = 0; i < 10; i++)
+		srv_tf_report_conn_err(&tf_ut_srv, &tf_ut_srv, SRV_TF_ERR_LOCAL);
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_PRIMARY);
+	TF_UT_CHECK(tf_ut_srv.tf.fail == 0);
+
+	/* a success in the middle of a failure sequence must reset it */
+	tf_ut_reset();
+	srv_tf_report_conn_err(&tf_ut_srv, &tf_ut_srv, SRV_TF_ERR_TRANSP);
+	srv_tf_report_conn_err(&tf_ut_srv, &tf_ut_srv, SRV_TF_ERR_TRANSP);
+	srv_tf_report_conn_ok(&tf_ut_srv, &tf_ut_srv);
+	TF_UT_CHECK(tf_ut_srv.tf.fail == 0);
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_PRIMARY);
+	srv_tf_report_conn_err(&tf_ut_srv, &tf_ut_srv, SRV_TF_ERR_TRANSP);
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_DEGRADED);
+}
+
+/* a failed health check must move the traffic away as soon as the check itself
+ * concluded, and the failure must be absorbed so the server stays up
+ */
+static void tf_ut_check_driven(void)
+{
+	tf_ut_reset();
+	TF_UT_CHECK(srv_tf_absorb_check_failure(&tf_ut_srv) == 1);
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_FALLBACK);
+	TF_UT_CHECK(tf_ut_srv.tf.reason == SRV_TF_RS_CHECK);
+
+	/* with an unusable fallback transport the failure must not be absorbed
+	 * so that the server is marked down as usual
+	 */
+	tf_ut_reset();
+	tf_ut_fb.cur_state = SRV_ST_STOPPED;
+	TF_UT_CHECK(srv_tf_absorb_check_failure(&tf_ut_srv) == 0);
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_PRIMARY);
+
+	/* a server without the feature must never absorb anything */
+	tf_ut_reset();
+	tf_ut_srv.flags &= ~SRV_F_TF_ENABLED;
+	TF_UT_CHECK(srv_tf_absorb_check_failure(&tf_ut_srv) == 0);
+}
+
+/* the rise counter and the hold-down timer must both be honoured before
+ * coming back to the primary transport
+ */
+static void tf_ut_rise_and_hold(void)
+{
+	int i;
+
+	tf_ut_reset();
+	tf_ut_srv.tf.rise_thres = 3;
+	tf_ut_srv.tf.hold = 30000;
+	srv_tf_absorb_check_failure(&tf_ut_srv);
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_FALLBACK);
+
+	/* first successful probe moves to PRIMARY_PROBING */
+	srv_tf_report_check(&tf_ut_srv, 1);
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_PROBING);
+	TF_UT_CHECK(tf_ut_srv.tf.rise == 1);
+	TF_UT_CHECK(tf_ut_srv.tf.recov == 1);
+
+	/* a failed probe must restart the sequence */
+	srv_tf_report_check(&tf_ut_srv, 0);
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_FALLBACK);
+	TF_UT_CHECK(tf_ut_srv.tf.rise == 0);
+
+	/* enough probes, but the hold-down delay has not elapsed yet */
+	for (i = 0; i < 5; i++)
+		srv_tf_report_check(&tf_ut_srv, 1);
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_PROBING);
+	TF_UT_CHECK(srv_tf_endpoint(&tf_ut_srv) == &tf_ut_fb);
+
+	/* pretend the switch happened long ago, the next probe must bring the
+	 * traffic back to the primary transport
+	 */
+	tf_ut_srv.tf.fb_since = now_ms - (tf_ut_srv.tf.hold + 1000);
+	srv_tf_report_check(&tf_ut_srv, 1);
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_PRIMARY);
+	TF_UT_CHECK(tf_ut_srv.tf.reason == SRV_TF_RS_PROBE_OK);
+	TF_UT_CHECK(tf_ut_srv.tf.switches == 2);
+	TF_UT_CHECK(srv_tf_endpoint(&tf_ut_srv) == &tf_ut_srv);
+}
+
+/* when the fallback transport fails too, it must be left aside and the primary
+ * one used again so the stream fails fast instead of looping
+ */
+static void tf_ut_fallback_failure(void)
+{
+	int i;
+
+	tf_ut_reset();
+	tf_ut_srv.tf.fall_thres = 3;
+	srv_tf_absorb_check_failure(&tf_ut_srv);
+	TF_UT_CHECK(srv_tf_endpoint(&tf_ut_srv) == &tf_ut_fb);
+
+	for (i = 0; i < 3; i++)
+		srv_tf_report_conn_err(&tf_ut_srv, &tf_ut_fb, SRV_TF_ERR_TRANSP);
+	TF_UT_CHECK(tf_ut_srv.tf.fb_fail == 3);
+	TF_UT_CHECK(tf_ut_srv.tf.reason == SRV_TF_RS_FB_DOWN);
+
+	/* no usable transport left: connections go back to the primary one and
+	 * the health check failure is no longer absorbed
+	 */
+	TF_UT_CHECK(srv_tf_endpoint(&tf_ut_srv) == &tf_ut_srv);
+	TF_UT_CHECK(srv_tf_absorb_check_failure(&tf_ut_srv) == 0);
+
+	/* after the hold-down delay the fallback transport gets a new chance */
+	tf_ut_srv.tf.fb_fail_since = now_ms - (tf_ut_srv.tf.hold + 1000);
+	TF_UT_CHECK(srv_tf_endpoint(&tf_ut_srv) == &tf_ut_fb);
+	TF_UT_CHECK(tf_ut_srv.tf.fb_fail == 0);
+
+	/* a working fallback connection clears the counter */
+	tf_ut_srv.tf.fb_fail = 2;
+	srv_tf_report_conn_ok(&tf_ut_srv, &tf_ut_fb);
+	TF_UT_CHECK(tf_ut_srv.tf.fb_fail == 0);
+}
+
+/* only the first attempt of a stream may be charged to the transport, and the
+ * error codes must be classified as expected
+ */
+static void tf_ut_classify(void)
+{
+	struct connection conn = { };
+	struct stream s = { };
+
+	conn.err_code = CO_ER_SOCK_ERR;
+	s.conn_retries = 0;
+	TF_UT_CHECK(srv_tf_classify_conn_err(&conn, &s) == SRV_TF_ERR_TRANSP);
+
+	/* a retry of the same stream must not be counted again */
+	s.conn_retries = 1;
+	TF_UT_CHECK(srv_tf_classify_conn_err(&conn, &s) == SRV_TF_ERR_NONE);
+
+	s.conn_retries = 0;
+	conn.err_code = CO_ER_FREE_PORTS;
+	TF_UT_CHECK(srv_tf_classify_conn_err(&conn, &s) == SRV_TF_ERR_LOCAL);
+
+	conn.err_code = CO_ER_SSL_MISMATCH_SNI;
+	TF_UT_CHECK(srv_tf_classify_conn_err(&conn, &s) == SRV_TF_ERR_LOCAL);
+
+	conn.err_code = CO_ER_SSL_HANDSHAKE;
+	TF_UT_CHECK(srv_tf_classify_conn_err(&conn, &s) == SRV_TF_ERR_TRANSP);
+
+	/* a connect timeout is only known by the stream layer */
+	conn.err_code = CO_ER_NONE;
+	s.conn_err_type = STRM_ET_CONN_TO;
+	TF_UT_CHECK(srv_tf_classify_conn_err(&conn, &s) == SRV_TF_ERR_TRANSP);
+
+	s.conn_err_type = 0;
+	TF_UT_CHECK(srv_tf_classify_conn_err(&conn, &s) == SRV_TF_ERR_NONE);
+}
+
+/* the probe interval is only overridden while the fallback transport is used */
+static void tf_ut_probe_interval(void)
+{
+	tf_ut_reset();
+	tf_ut_srv.tf.probe = 1234;
+	tf_ut_srv.check.server = &tf_ut_srv;
+
+	TF_UT_CHECK(srv_tf_check_interval(&tf_ut_srv.check) == 0);
+	srv_tf_absorb_check_failure(&tf_ut_srv);
+	TF_UT_CHECK(srv_tf_check_interval(&tf_ut_srv.check) == 1234);
+
+	/* the agent check must never be impacted */
+	tf_ut_srv.agent.server = &tf_ut_srv;
+	tf_ut_srv.agent.state = CHK_ST_AGENT;
+	TF_UT_CHECK(srv_tf_check_interval(&tf_ut_srv.agent) == 0);
+
+	/* nor should it apply when disabled */
+	tf_ut_srv.tf.probe = 0;
+	TF_UT_CHECK(srv_tf_check_interval(&tf_ut_srv.check) == 0);
+}
+
+/* hammers the state machine from several threads at once to check that the
+ * transitions stay consistent and that the counters do not drift. Meant to be
+ * run under ThreadSanitizer as well.
+ */
+#define TF_UT_THREADS 8
+#define TF_UT_ROUNDS  20000
+
+/* 0: all threads report primary transport failures,
+ * 1: all threads report successful primary probes.
+ */
+static uint tf_ut_phase;
+
+static void *tf_ut_thread(void *arg)
+{
+	const struct server *ep;
+	int i;
+
+	for (i = 0; i < TF_UT_ROUNDS; i++) {
+		if (HA_ATOMIC_LOAD(&tf_ut_phase) == 0)
+			srv_tf_report_conn_err(&tf_ut_srv, &tf_ut_srv, SRV_TF_ERR_TRANSP);
+		else
+			srv_tf_report_check(&tf_ut_srv, 1);
+
+		/* whatever the concurrent transitions, a connection must
+		 * always be given one of the two known transports
+		 */
+		ep = srv_tf_endpoint(&tf_ut_srv);
+		if (ep != &tf_ut_srv && ep != &tf_ut_fb)
+			HA_ATOMIC_INC(&tf_ut_errors);
+
+		if (HA_ATOMIC_LOAD(&tf_ut_srv.tf.state) >= SRV_TF_ST_ENTRIES)
+			HA_ATOMIC_INC(&tf_ut_errors);
+	}
+	return NULL;
+}
+
+/* Runs TF_UT_THREADS threads hammering the state machine at once. The point is
+ * that a transition happens exactly once whatever the number of threads which
+ * observe the triggering condition, which is what the CAS on the state is for.
+ */
+static int tf_ut_run_threads(void)
+{
+	pthread_t th[TF_UT_THREADS];
+	long i;
+
+	for (i = 0; i < TF_UT_THREADS; i++) {
+		if (pthread_create(&th[i], NULL, tf_ut_thread, (void *)i) != 0) {
+			fprintf(stderr, "  FAIL cannot create thread %ld\n", i);
+			tf_ut_errors++;
+			while (--i >= 0)
+				pthread_join(th[i], NULL);
+			return 0;
+		}
+	}
+	for (i = 0; i < TF_UT_THREADS; i++)
+		pthread_join(th[i], NULL);
+	return 1;
+}
+
+static void tf_ut_concurrency(void)
+{
+	int old_mode = global.mode;
+
+	tf_ut_reset();
+	tf_ut_srv.tf.fall_thres = 3;
+	tf_ut_srv.tf.rise_thres = 3;
+	tf_ut_srv.tf.hold = 0;
+
+	/* keep the logs quiet, the point here is the state consistency */
+	global.mode |= MODE_STARTING;
+
+	/* phase 1: everybody reports failures, a single switch must happen */
+	HA_ATOMIC_STORE(&tf_ut_phase, 0);
+	if (!tf_ut_run_threads())
+		goto out;
+
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_FALLBACK);
+	TF_UT_CHECK(tf_ut_srv.tf.switches == 1);
+	TF_UT_CHECK(tf_ut_srv.tf.prim_fail == (uint)(TF_UT_THREADS * TF_UT_ROUNDS));
+	TF_UT_CHECK(srv_tf_endpoint(&tf_ut_srv) == &tf_ut_fb);
+
+	/* phase 2: everybody reports successful probes, a single switch back */
+	HA_ATOMIC_STORE(&tf_ut_phase, 1);
+	if (!tf_ut_run_threads())
+		goto out;
+
+	TF_UT_CHECK(tf_ut_srv.tf.state == SRV_TF_ST_PRIMARY);
+	TF_UT_CHECK(tf_ut_srv.tf.switches == 2);
+	TF_UT_CHECK(srv_tf_endpoint(&tf_ut_srv) == &tf_ut_srv);
+
+	fprintf(stdout, "  %d threads x %d rounds x 2 phases: %u switches, "
+	        "%u recoveries, %u failures counted\n",
+	        TF_UT_THREADS, TF_UT_ROUNDS, tf_ut_srv.tf.switches,
+	        tf_ut_srv.tf.recov, tf_ut_srv.tf.prim_fail);
+ out:
+	global.mode = old_mode;
+}
+
+static int srv_tf_unittest(int argc, char **argv)
+{
+	tf_ut_errors = 0;
+
+	fprintf(stdout, "Testing transport failover state machine\n");
+	tf_ut_defaults();
+	tf_ut_fall_counter();
+	tf_ut_check_driven();
+	tf_ut_rise_and_hold();
+	tf_ut_fallback_failure();
+	tf_ut_classify();
+	tf_ut_probe_interval();
+	tf_ut_concurrency();
+
+	if (tf_ut_errors) {
+		fprintf(stderr, "%d check(s) failed\n", tf_ut_errors);
+		return 1;
+	}
+	fprintf(stdout, "All transport failover checks passed\n");
+	return 0;
+}
+
+REGISTER_UNITTEST("srv_tf", srv_tf_unittest);
+
+#endif /* DEBUG_UNIT */
