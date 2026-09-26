@@ -46,6 +46,7 @@
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
+#include <haproxy/server_tf.h>
 #include <haproxy/stats.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stconn.h>
@@ -165,6 +166,14 @@ int srv_downtime(const struct server *s)
 int srv_getinter(const struct check *check)
 {
 	const struct server *s = check->server;
+	int tf_inter;
+
+	/* while the fallback transport carries the traffic, this check is what
+	 * probes the primary transport, at its own dedicated interval.
+	 */
+	tf_inter = srv_tf_check_interval(check);
+	if (tf_inter)
+		return tf_inter;
 
 	if ((check->state & (CHK_ST_CONFIGURED|CHK_ST_FASTINTER)) == CHK_ST_CONFIGURED &&
 	    (check->health == check->rise + check->fall - 1))
@@ -942,6 +951,96 @@ static int srv_parse_enabled(char **args, int *cur_arg,
 }
 
 /* Parse the "error-limit" server keyword */
+/* Parse the "fallback-transport" server keyword, which references the server
+ * describing the alternate transport to use when the primary one fails. The
+ * reference is resolved later, once all the backends are known.
+ */
+static int srv_parse_fallback_transport(char **args, int *cur_arg,
+                                        struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	char *arg = args[*cur_arg + 1];
+
+	if (!*arg) {
+		memprintf(err, "'%s' expects [<backend>/]<server> as argument.", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	ha_free(&newsrv->tf.fb_name);
+	newsrv->tf.fb_name = strdup(arg);
+	if (!newsrv->tf.fb_name) {
+		memprintf(err, "out of memory.");
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	return 0;
+}
+
+/* Parse the "transport-fall" and "transport-rise" server keywords which set
+ * the transport failover hysteresis thresholds.
+ */
+static int srv_parse_transport_count(char **args, int *cur_arg,
+                                     struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	int val;
+
+	if (!*args[*cur_arg + 1]) {
+		memprintf(err, "'%s' expects an integer argument.", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	val = atoi(args[*cur_arg + 1]);
+	if (val <= 0) {
+		memprintf(err, "'%s' has to be > 0.", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (strcmp(args[*cur_arg], "transport-fall") == 0)
+		newsrv->tf.fall_thres = val;
+	else
+		newsrv->tf.rise_thres = val;
+
+	return 0;
+}
+
+/* Parse the "transport-probe" and "transport-hold" server keywords which set
+ * the primary transport probe interval and the fallback hold-down delay.
+ */
+static int srv_parse_transport_time(char **args, int *cur_arg,
+                                    struct proxy *curproxy, struct server *newsrv, char **err)
+{
+	const char *res;
+	char *arg = args[*cur_arg + 1];
+	unsigned int time;
+
+	if (!*arg) {
+		memprintf(err, "'%s' expects <time> as argument.", args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	res = parse_time_err(arg, &time, TIME_UNIT_MS);
+	if (res == PARSE_TIME_OVER) {
+		memprintf(err, "timer overflow in argument '%s' to '%s' (maximum value is 2147483647 ms or ~24.8 days)",
+		          arg, args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	else if (res == PARSE_TIME_UNDER) {
+		memprintf(err, "timer underflow in argument '%s' to '%s' (minimum non-null value is 1 ms)",
+		          arg, args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+	else if (res) {
+		memprintf(err, "unexpected character '%c' in argument to <%s>.", *res, args[*cur_arg]);
+		return ERR_ALERT | ERR_FATAL;
+	}
+
+	if (strcmp(args[*cur_arg], "transport-probe") == 0)
+		newsrv->tf.probe = time;
+	else
+		newsrv->tf.hold = time;
+
+	return 0;
+}
+
 static int srv_parse_error_limit(char **args, int *cur_arg,
                                  struct proxy *curproxy, struct server *newsrv, char **err)
 {
@@ -2452,6 +2551,11 @@ static struct srv_kw_list srv_kws = { "ALL", { }, {
 	{ "disabled",             srv_parse_disabled,             0,  1,  1 }, /* Start the server in 'disabled' state */
 	{ "enabled",              srv_parse_enabled,              0,  1,  0 }, /* Start the server in 'enabled' state */
 	{ "error-limit",          srv_parse_error_limit,          1,  1,  1 }, /* Configure the consecutive count of check failures to consider a server on error */
+	{ "fallback-transport",   srv_parse_fallback_transport,   1,  0,  0 }, /* Set the server describing the fallback transport */
+	{ "transport-fall",       srv_parse_transport_count,      1,  1,  0 }, /* Primary transport failures before using the fallback transport */
+	{ "transport-rise",       srv_parse_transport_count,      1,  1,  0 }, /* Primary transport probe successes before switching back */
+	{ "transport-probe",      srv_parse_transport_time,       1,  1,  0 }, /* Primary transport probe interval while on fallback */
+	{ "transport-hold",       srv_parse_transport_time,       1,  1,  0 }, /* Minimum time spent on the fallback transport */
 	{ "guid",                 srv_parse_guid,                 1,  0,  1 }, /* Set global unique ID of the server */
 	{ "ws",                   srv_parse_ws,                   1,  1,  1 }, /* websocket protocol */
 	{ "hash-key",             srv_parse_hash_key,             1,  1,  1 }, /* Configure how chash keys are computed */
@@ -2915,6 +3019,8 @@ void srv_settings_init(struct server *srv)
 	srv->onerror = DEF_HANA_ONERR;
 	srv->consecutive_errors_limit = DEF_HANA_ERRLIMIT;
 
+	srv_tf_set_defaults(&srv->tf);
+
 	srv->uweight = srv->iweight = 1;
 
 #ifdef USE_QUIC
@@ -3044,6 +3150,12 @@ void srv_settings_cpy(struct server *srv, const struct server *src, int srv_tmpl
 	srv->onmarkedup               = src->onmarkedup;
 	if (src->trackit != NULL)
 		srv->trackit = strdup(src->trackit);
+	srv->tf.fall_thres            = src->tf.fall_thres;
+	srv->tf.rise_thres            = src->tf.rise_thres;
+	srv->tf.probe                 = src->tf.probe;
+	srv->tf.hold                  = src->tf.hold;
+	if (src->tf.fb_name != NULL)
+		srv->tf.fb_name = strdup(src->tf.fb_name);
 	srv->consecutive_errors_limit = src->consecutive_errors_limit;
 	srv->uweight = srv->iweight   = src->iweight;
 
@@ -3239,6 +3351,7 @@ void srv_free_params(struct server *srv)
 	free(srv->cc_algo);
 	free(srv->tcp_md5sig);
 	free(srv->addr_key);
+	srv_tf_deinit(srv);
 	counters_be_shared_drop(&srv->counters.shared);
 	if (srv->log_target) {
 		deinit_log_target(srv->log_target);

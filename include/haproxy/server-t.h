@@ -174,6 +174,8 @@ enum srv_init_state {
 #define SRV_F_STRICT_MAXCONN 0x10000     /* maxconn is to be strictly enforced, as a limit of outbound connections */
 #define SRV_F_CHK_NO_AUTO_SNI 0x20000    /* disable automatic SNI selection for healthcheck */
 #define SRV_F_UDP_GSO_NOTSUPP 0x40000    /* UDP GSO is disabled due to a previous error encountered */
+#define SRV_F_TF_ENABLED   0x80000       /* transport failover is configured on this server */
+#define SRV_F_TF_FALLBACK  0x100000      /* this server is used as a fallback transport by another one */
 
 /* configured server options for send-proxy (server->pp_opts) */
 #define SRV_PP_V1               0x0001   /* proxy protocol version 1 */
@@ -336,6 +338,58 @@ struct path_parameters {
 #endif
 };
 
+/* Transport failover states. A server whose primary transport becomes
+ * unreliable temporarily directs its new connections to a fallback server
+ * which describes an alternate transport (e.g. QUIC instead of TCP). The
+ * state only evolves on rare events (connection failures, health check
+ * transitions), it is read on the connection setup path.
+ */
+enum srv_tf_state {
+	SRV_TF_ST_PRIMARY = 0,  /* primary transport used, no failure recorded */
+	SRV_TF_ST_DEGRADED,     /* primary transport used, some failures recorded */
+	SRV_TF_ST_FALLBACK,     /* fallback transport used, primary considered dead */
+	SRV_TF_ST_PROBING,      /* fallback transport used, primary probes succeeding */
+	SRV_TF_ST_ENTRIES       /* must be last */
+};
+
+/* Reason of the last transport state transition, for reporting purposes */
+enum srv_tf_reason {
+	SRV_TF_RS_NONE = 0,
+	SRV_TF_RS_CONN_ERR,     /* data plane connection failures */
+	SRV_TF_RS_CHECK,        /* health check transition */
+	SRV_TF_RS_PROBE_OK,     /* primary probes succeeded and hold-down elapsed */
+	SRV_TF_RS_FB_DOWN,      /* fallback transport became unusable */
+	SRV_TF_RS_ADMIN,        /* forced from the CLI */
+	SRV_TF_RS_ENTRIES       /* must be last */
+};
+
+/* Transport failover context, embedded in every server but only used when
+ * SRV_F_TF_ENABLED is set, so that the regular connection path only pays for
+ * a flag test. All the fields below are updated using atomic operations, the
+ * state transitions themselves being serialized with a CAS on <state>.
+ */
+struct srv_tf {
+	struct server *fb_srv;          /* server describing the fallback transport */
+	char *fb_name;                  /* "[<backend>/]<server>" as found in the config */
+	uint state;                     /* enum srv_tf_state */
+	uint fail;                      /* consecutive primary transport failures */
+	uint rise;                      /* consecutive primary probe successes */
+	uint fb_fail;                   /* consecutive fallback transport failures */
+	int fall_thres;                 /* failures before leaving the primary transport */
+	int rise_thres;                 /* probe successes before returning to primary */
+	int probe;                      /* primary probe interval while on fallback (ms) */
+	int hold;                       /* min time spent on the fallback transport (ms) */
+	uint last_switch;               /* date of the last transport transition */
+	uint fb_since;                  /* date the fallback transport became active */
+	uint fb_fail_since;             /* date the fallback transport was declared failed */
+	uint reason;                    /* enum srv_tf_reason of the last transition */
+	/* statistics, only updated on transitions or connection setup */
+	uint switches;                  /* total number of transport transitions */
+	uint fb_conns;                  /* connections started on the fallback transport */
+	uint prim_fail;                 /* total primary transport failures observed */
+	uint recov;                     /* recovery attempts (probe sequences started) */
+};
+
 struct proxy;
 struct server {
 	/* mostly config or admin stuff, doesn't change often */
@@ -466,6 +520,7 @@ struct server {
 	int do_agent;                           /* temporary variable used during parsing to denote if an auxiliary agent check must be enabled */
 	struct check check;                     /* health-check specific configuration */
 	struct check agent;                     /* agent specific configuration */
+	struct srv_tf tf;                       /* transport failover context (see SRV_F_TF_ENABLED) */
 
 	struct resolv_requester *resolv_requester; /* used to link a server to its DNS resolution */
 	char *resolvers_id;			/* resolvers section used by this server */

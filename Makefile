@@ -935,7 +935,7 @@ OBJS += src/mux_h2.o src/mux_h1.o src/mux_fcgi.o src/log.o		\
         src/flt_http_comp.o src/sock.o src/h1.o src/sink.o		\
         src/ceba_tree.o src/session.o src/payload.o src/htx.o		\
         src/cebl_tree.o src/ceb32_tree.o src/ceb64_tree.o		\
-        src/server_state.o src/proto_rhttp.o src/flt_trace.o src/fd.o	\
+        src/server_state.o src/server_tf.o src/proto_rhttp.o src/flt_trace.o src/fd.o	\
         src/task.o src/map.o src/fcgi-app.o src/h2.o src/mworker.o	\
         src/tcp_sample.o src/mjson.o src/h1_htx.o src/tcp_act.o		\
         src/ring.o src/flt_bwlim.o src/acl.o src/thread.o src/queue.o	\
