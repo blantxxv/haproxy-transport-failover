@@ -18872,6 +18872,83 @@ fall <count>
   <count> consecutive unsuccessful health checks. This value defaults to 3 if
   unspecified. See also the "check", "inter" and "rise" parameters.
 
+fallback-transport [<backend>/]<server>
+  May be used in the following contexts: tcp, http
+
+  Declares that <server> describes an alternate transport for reaching the same
+  endpoint as the current server, to be used while the transport of the current
+  server ("the primary transport") is unusable. This is typically used to keep
+  serving traffic over QUIC when TCP connections are blocked on the path, or
+  the other way around. If <backend> is omitted the current one is used.
+
+  The referenced server is an ordinary server: it carries its own address,
+  protocol, transport layer, mux protocol, TLS parameters and health check.
+  This is what makes transports as different as TCP and QUIC usable together,
+  since each of them needs its own TLS context. New connections are simply
+  directed to it while the primary transport is considered down, so all its
+  settings apply to them, including its own "timeout connect" inherited from
+  its backend.
+
+  Both proxies must run in the same mode, and the referenced server must not
+  declare a fallback transport itself, as chaining is not supported. The
+  current server must have "check" enabled, because its health check is what
+  probes the primary transport while the fallback one is in use. A warning is
+  emitted if the referenced server has no "check", in which case the
+  availability of the fallback transport is only deduced from live traffic.
+
+  Each server using a fallback transport walks through the following states,
+  which are reported by "show servers transport" on the stats socket and by
+  the "transport_state" stats field:
+
+    PRIMARY_ACTIVE    new connections use the primary transport, no failure
+                      has been recorded recently.
+    PRIMARY_DEGRADED  new connections still use the primary transport but
+                      failures have been recorded, below "transport-fall".
+    FALLBACK_ACTIVE   new connections use the fallback transport, the primary
+                      one is being probed by the health check.
+    PRIMARY_PROBING   new connections still use the fallback transport, but
+                      the primary transport answered at least one probe.
+
+  The primary transport is declared unusable either when its health check
+  fails "fall" times, or when "transport-fall" consecutive connection failures
+  have been observed on the data plane. Only failures which denote a broken
+  transport are counted, such as a connect timeout, a connection refused, an
+  unreachable network or host, or a failed handshake. Failures caused by local
+  resource exhaustion (source ports, file descriptors) or by a certificate
+  mismatch are not counted, as switching transport would not help. At most one
+  failure per session is counted so that a single client retrying cannot move
+  a whole server to its fallback transport.
+
+  Returning to the primary transport requires "transport-rise" successful
+  probes and the "transport-hold" delay to have elapsed since the switch,
+  which is what prevents flapping between both transports.
+
+  Existing connections are never migrated from one transport to the other:
+  TCP and QUIC do not share the same semantics. Sessions running on the
+  primary transport when it breaks fail as usual, possibly retried according
+  to "retries", and only new connections use the other transport.
+
+  If the fallback transport also becomes unusable, the server stops absorbing
+  its health check failures and ends up being marked down as it would be
+  without this feature, so that the load balancer stops selecting it.
+
+  Example :
+
+    # the fallback transport: the same node reached over QUIC
+    backend nodes-quic
+        mode http
+        timeout connect 3s
+        server n1 quic4@10.0.0.2:443 ssl verify none alpn h3 check
+
+    backend nodes
+        mode http
+        timeout connect 2s
+        server n1 10.0.0.2:443 check inter 2s fall 3 rise 2 fallback-transport nodes-quic/n1 transport-fall 3 transport-rise 5 transport-probe 5s transport-hold 30s
+
+  See also the "transport-fall", "transport-rise", "transport-probe" and
+  "transport-hold" parameters, and the "show servers transport" command of the
+  management socket.
+
 force-sslv3
   May be used in the following contexts: tcp, http, log, peers, ring
 
@@ -20104,6 +20181,60 @@ track [<backend>/]<server>
 
     backend B
     server b1 2.2.2.2:80 check
+
+transport-fall <count>
+  May be used in the following contexts: tcp, http
+
+  Sets the number of consecutive connection failures observed on the data plane
+  after which the primary transport of this server is considered unusable and
+  new connections are directed to the transport declared by
+  "fallback-transport". This value defaults to 3. Only failures which denote a
+  broken transport are counted, and at most one per session. This parameter has
+  no effect if "fallback-transport" is not used. It also bounds the number of
+  connection failures tolerated on the fallback transport before it is in turn
+  considered unusable.
+
+  See also the "fallback-transport", "transport-rise", "transport-probe" and
+  "transport-hold" parameters.
+
+transport-hold <time>
+  May be used in the following contexts: tcp, http
+
+  Sets the minimum time the server keeps using its fallback transport before
+  returning to the primary one, even if the primary transport already answered
+  "transport-rise" probes. It also sets how long a fallback transport which was
+  declared unusable is left aside before being given another chance. The value
+  is in milliseconds by default but may be expressed in any other unit
+  supported by HAProxy, and defaults to 30 seconds. Together with
+  "transport-rise" this is what prevents flapping between both transports.
+
+  See also the "fallback-transport", "transport-fall", "transport-rise" and
+  "transport-probe" parameters.
+
+transport-probe <time>
+  May be used in the following contexts: tcp, http
+
+  Sets the interval at which the health check of this server probes the primary
+  transport while the fallback transport carries the traffic. It replaces
+  "inter", "fastinter" and "downinter" for that period only, so that the
+  primary transport may be probed more or less often than the regular check
+  interval. The value is in milliseconds by default but may be expressed in any
+  other unit supported by HAProxy, and defaults to 5 seconds. Setting it to 0
+  keeps the regular check interval.
+
+  See also the "fallback-transport", "transport-fall", "transport-rise" and
+  "transport-hold" parameters.
+
+transport-rise <count>
+  May be used in the following contexts: tcp, http
+
+  Sets the number of consecutive successful probes of the primary transport
+  required before new connections are directed back to it. The "transport-hold"
+  delay must also have elapsed. This value defaults to 5. This parameter has no
+  effect if "fallback-transport" is not used.
+
+  See also the "fallback-transport", "transport-fall", "transport-probe" and
+  "transport-hold" parameters.
 
 tls-tickets
   May be used in the following contexts: tcp, http, log, peers, ring

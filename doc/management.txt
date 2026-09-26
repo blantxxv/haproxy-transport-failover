@@ -3590,6 +3590,43 @@ show servers state [<backend>]
      srv_agent_addr:              Server health agent address.
      srv_agent_port:              Server health agent port.
 
+show servers transport [<backend>]
+  Dump the transport failover state of the servers configured with a
+  "fallback-transport". Servers which do not use this feature are not listed. A
+  backend name or identifier may be provided to limit the output to this backend
+  only. The first line is a comment describing the fields, which are:
+
+    bkname/svname    Backend and server names.
+    bkid/svid        Backend and server unique ids.
+    state=           Transport failover state, one of PRIMARY_ACTIVE,
+                     PRIMARY_DEGRADED, FALLBACK_ACTIVE or PRIMARY_PROBING.
+    current=         Transport used by new connections: primary or fallback.
+    primary=         Health of the primary transport: up, degraded or down.
+    fallback=        Backend/server describing the fallback transport, followed
+                     by its availability.
+    fail=            Consecutive primary transport failures observed on the
+                     data plane, and the "transport-fall" threshold.
+    rise=            Consecutive successful probes of the primary transport,
+                     and the "transport-rise" threshold.
+    fb_fail=         Consecutive failures observed on the fallback transport.
+    switches=        Total number of transitions between both transports.
+    fb_conns=        Connections started on the fallback transport.
+    prim_fail=       Total primary transport failures observed.
+    recov=           Number of primary transport recovery attempts.
+    probe=           Primary transport probe interval while on fallback.
+    hold=            Minimum time spent on the fallback transport.
+    last_change=     Time elapsed since the last transition, -1 if none.
+    reason=          Reason of the last transition.
+
+  Example :
+
+    $ echo "show servers transport nodes" | socat /var/run/haproxy.sock -
+    # bkname/svname bkid/svid state= current= primary= fallback= ...
+    nodes/n1 4/1 state=FALLBACK_ACTIVE current=fallback primary=down \
+      fallback=nodes-quic/n1:up fail=3/3 rise=0/5 fb_fail=0 switches=1 \
+      fb_conns=128 prim_fail=3 recov=0 probe=5000ms hold=30000ms \
+      last_change=2486ms reason=health check
+
 show sess [<options>*]
   Dump all known active streams (formerly called "sessions"). Avoid doing this
   on slow connections as this can be huge. This command is restricted and can
