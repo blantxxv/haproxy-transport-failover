@@ -18892,9 +18892,10 @@ fallback-transport [<backend>/]<server>
   Both proxies must run in the same mode, and the referenced server must not
   declare a fallback transport itself, as chaining is not supported. The
   current server must have "check" enabled, because its health check is what
-  probes the primary transport while the fallback one is in use. A warning is
-  emitted if the referenced server has no "check", in which case the
-  availability of the fallback transport is only deduced from live traffic.
+  probes the primary transport while the fallback one is in use. Giving the
+  referenced server its own "check" is recommended but not required: without
+  it, the availability of the fallback transport is only deduced from live
+  traffic, which is reported as a diagnostic in "-dD" mode.
 
   Each server using a fallback transport walks through the following states,
   which are reported by "show servers transport" on the stats socket and by

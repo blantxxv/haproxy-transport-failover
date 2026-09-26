@@ -23,6 +23,7 @@
 # built with USE_QUIC=1.
 #
 # Usage: ./run.sh [test-number ...]     (default: all tests)
+#        ./run.sh demo                  (narrated walk through the life cycle)
 
 set -u
 
@@ -690,6 +691,79 @@ test10()  # load test, on both transports
 	end_test $f
 }
 
+# ------------------------------------------------------------------- demo
+
+# Walks through the whole life cycle and reports, for each phase, the state
+# machine, what the logs say and what is actually seen on the wire. This is the
+# human readable counterpart of the assertions above.
+demo_phase()
+{
+	local title=$1 tag=$2 reqs=${3:-3} i
+	local syn udp
+
+	printf '\n--- %s ---\n' "$title"
+	cap_start "$tag"
+	for i in $(seq 1 "$reqs"); do
+		printf '    request %d -> %s\n' "$i" "$(req | tr -d '\n')"
+	done
+	cap_stop
+
+	syn=$(cap_tcp_syns)
+	udp=$(cap_udp_pkts)
+	printf '    runtime : %s\n' "$(cli "show servers transport nodes" | grep '^nodes/')"
+	printf '    stats   : status=%s transport=%s/%s switches=%s\n' \
+	       "$(srv_status nodes n1)" \
+	       "$(cli 'show stat' | awk -F, '$1=="nodes" && $2=="n1" {print $119}')" \
+	       "$(cli 'show stat' | awk -F, '$1=="nodes" && $2=="n1" {print $120}')" \
+	       "$(cli 'show stat' | awk -F, '$1=="nodes" && $2=="n1" {print $122}')"
+	printf '    packets : %s new TCP connections, %s QUIC datagrams on the service port\n' \
+	       "$syn" "$udp"
+	if [ "$syn" -gt 0 ] && [ "$udp" -eq 0 ]; then
+		printf '    verdict : traffic flows over TCP\n'
+	elif [ "$udp" -gt 0 ] && [ "$syn" -eq 0 ]; then
+		printf '    verdict : traffic flows over QUIC\n'
+	else
+		printf '    verdict : mixed or no traffic (tcp=%s quic=%s)\n' "$syn" "$udp"
+	fi
+}
+
+demo_run()
+{
+	local before
+
+	head1 "Transport failover demonstration"
+	printf 'thresholds: transport-fall=%s transport-rise=%s transport-probe=%s transport-hold=%s\n' \
+	       "$TF_FALL" "$TF_RISE" "$TF_PROBE" "$TF_HOLD"
+
+	demo_phase "1. TCP UP: the primary transport carries the traffic" d1
+
+	before=$(wc -l < "$RUNDIR/haproxy.log")
+	block_tcp_drop
+	printf '\n>>> injecting failure: nft drop on tcp dport %s and %s\n' "$SVC_PORT" "$CHK_PORT_TCP"
+	wait_state FALLBACK_ACTIVE 20 >/dev/null
+	demo_phase "2. TCP DOWN: the fallback transport took over" d2
+	printf '    logs    :\n'
+	tail -n +$((before + 1)) "$RUNDIR/haproxy.log" | grep -i 'transport' | sed 's/^/              /'
+
+	before=$(wc -l < "$RUNDIR/haproxy.log")
+	unblock_all
+	printf '\n>>> TCP restored, the primary transport is being probed\n'
+	# catch the intermediate state while the probes are being counted
+	local i
+	for i in $(seq 1 40); do
+		[ "$(tf_field state)" = "PRIMARY_PROBING" ] && break
+		sleep 0.1
+	done
+	demo_phase "3. TCP RECOVERING: probes succeed, traffic still on the fallback" d3 1
+
+	wait_state PRIMARY_ACTIVE 30 >/dev/null
+	demo_phase "4. TCP ACTIVE: traffic is back on the primary transport" d4
+	printf '    logs    :\n'
+	tail -n +$((before + 1)) "$RUNDIR/haproxy.log" | grep -i 'transport' | sed 's/^/              /'
+
+	printf '\ncaptures kept in %s (d1..d4.pcap)\n' "$ARTIFACTS"
+}
+
 # ----------------------------------------------------------------- main
 
 trap 'cleanup' EXIT INT TERM
@@ -709,7 +783,10 @@ for t in $TESTS; do
 	netem_clear
 	unblock_all
 	wait_state PRIMARY_ACTIVE 30 >/dev/null
-	"test$t"
+	case "$t" in
+		demo) demo_run ;;
+		*)    "test$t" ;;
+	esac
 done
 
 head1 "Summary"

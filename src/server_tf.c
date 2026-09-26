@@ -573,10 +573,14 @@ int srv_tf_init(struct server *srv, struct proxy *px)
 		return 1;
 	}
 
+	/* A fallback transport without its own health check is a valid setup,
+	 * its availability is then only deduced from live traffic, hence a
+	 * diagnostic rather than a warning.
+	 */
 	if (!fb->do_check)
-		ha_warning("server '%s/%s' is used as a fallback transport without 'check' : "
-		           "its availability will only be deduced from live traffic.\n",
-		           fbpx->id, fb->id);
+		ha_diag_warning("server '%s/%s' is used as a fallback transport without "
+		                "'check' : its availability will only be deduced from "
+		                "live traffic.\n", fbpx->id, fb->id);
 
 	srv->tf.fb_srv = fb;
 	srv->flags |= SRV_F_TF_ENABLED;
