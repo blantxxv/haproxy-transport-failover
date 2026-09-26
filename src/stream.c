@@ -47,6 +47,7 @@
 #include <haproxy/queue.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
+#include <haproxy/server_tf.h>
 #include <haproxy/resolvers.h>
 #include <haproxy/sample.h>
 #include <haproxy/session.h>
@@ -1014,8 +1015,18 @@ void back_establish(struct stream *s)
 		DBG_TRACE_STATE("read/write error", STRM_EV_STRM_PROC|STRM_EV_CS_ST|STRM_EV_STRM_ERR, s);
 	}
 
-	if (objt_server(s->target))
-		health_adjust(__objt_server(s->target), HANA_STATUS_L4_OK);
+	if (objt_server(s->target)) {
+		struct server *srv = __objt_server(s->target);
+
+		health_adjust(srv, HANA_STATUS_L4_OK);
+
+		/* a working connection clears the transport failure counters */
+		if (srv->flags & SRV_F_TF_ENABLED) {
+			struct connection *conn = sc_conn(s->scb);
+
+			srv_tf_report_conn_ok(srv, conn ? objt_server(conn->target) : NULL);
+		}
+	}
 
 	if (strm_fe(s)->to_log == LW_LOGSTEPS) {
 		if (log_orig_proxy(LOG_ORIG_TXN_CONNECT, strm_fe(s)))

@@ -52,6 +52,7 @@
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
+#include <haproxy/server_tf.h>
 #include <haproxy/session.h>
 #include <haproxy/ssl_sock.h>
 #include <haproxy/stconn.h>
@@ -1820,6 +1821,7 @@ int connect_server(struct stream *s)
 	struct connection *srv_conn = NULL;
 	const struct mux_proto_list *mux_proto = NULL;
 	struct server *srv;
+	struct server *tsrv;
 	struct ist name = IST_NULL;
 	struct sample *name_smp;
 	int reuse_mode;
@@ -1835,24 +1837,41 @@ int connect_server(struct stream *s)
 	srv = objt_server(s->target);
 	reuse_mode = be_reuse_mode(s->be, srv);
 
-	err = alloc_dst_address(&s->scb->dst, srv, s);
+	/* <srv> is the server the load balancer selected and the one all the
+	 * stream level accounting refers to. <tsrv> holds the transport to
+	 * really use for this connection: it is <srv> itself, or the server
+	 * describing its fallback transport when the primary one is currently
+	 * unusable. Everything related to the connection itself (address,
+	 * protocol, transport layer, mux, TLS context, idle connection pools)
+	 * is taken from <tsrv>.
+	 */
+	tsrv = srv ? srv_tf_endpoint(srv) : NULL;
+
+	if (unlikely(tsrv != srv) || (srv && (srv->flags & SRV_F_TF_ENABLED))) {
+		/* the cached destination address may have been computed for the
+		 * other transport during a previous attempt of this stream.
+		 */
+		sockaddr_free(&s->scb->dst);
+	}
+
+	err = alloc_dst_address(&s->scb->dst, tsrv, s);
 	if (err != SRV_STATUS_OK)
 		return SF_ERR_INTERNAL;
 
-	err = alloc_bind_address(&bind_addr, srv, s->be, s);
+	err = alloc_bind_address(&bind_addr, tsrv, s->be, s);
 	if (err != SRV_STATUS_OK)
 		return SF_ERR_INTERNAL;
 
-	if (srv && srv->pool_conn_name_expr) {
+	if (tsrv && tsrv->pool_conn_name_expr) {
 		name_smp = sample_fetch_as_type(s->be, s->sess, s,
 				SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
-				srv->pool_conn_name_expr, SMP_T_STR);
+				tsrv->pool_conn_name_expr, SMP_T_STR);
 		if (name_smp) {
 			name = ist2(name_smp->data.u.str.area,
 					name_smp->data.u.str.data);
 		}
 	}
-	hash = be_calculate_conn_hash(srv, s, s->sess, bind_addr, s->scb->dst, name);
+	hash = be_calculate_conn_hash(tsrv, s, s->sess, bind_addr, s->scb->dst, name);
 
 	if (!be_supports_conn_reuse(s->be))
 		goto skip_reuse;
@@ -1860,14 +1879,14 @@ int connect_server(struct stream *s)
 	/* disable reuse if websocket stream and the protocol to use is not the
 	 * same as the main protocol of the server.
 	 */
-	if (unlikely(s->flags & SF_WEBSOCKET) && srv && !srv_check_reuse_ws(srv)) {
+	if (unlikely(s->flags & SF_WEBSOCKET) && tsrv && !srv_check_reuse_ws(tsrv)) {
 		DBG_TRACE_STATE("skip idle connections reuse: websocket stream", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 	}
 	else {
 		const int not_first_req = s->txn.http && s->txn.http->flags & TX_NOT_FIRST;
 
-		err = be_reuse_connection(hash, s->sess, s->be, srv, s->scb,
-		                          s->target, not_first_req);
+		err = be_reuse_connection(hash, s->sess, s->be, tsrv, s->scb,
+		                          tsrv ? &tsrv->obj_type : s->target, not_first_req);
 		if (err == SF_ERR_INTERNAL)
 			return err;
 
@@ -1939,28 +1958,28 @@ int connect_server(struct stream *s)
 	if (!srv_conn) {
 		unsigned int total_conns;
 
-		if (srv && (srv->flags & SRV_F_RHTTP)) {
+		if (tsrv && (tsrv->flags & SRV_F_RHTTP)) {
 			DBG_TRACE_USER("cannot open a new connection for reverse server", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 			s->conn_err_type = STRM_ET_CONN_ERR;
 			return SF_ERR_INTERNAL;
 		}
 
-		if (srv && (srv->flags & SRV_F_STRICT_MAXCONN)) {
+		if (tsrv && (tsrv->flags & SRV_F_STRICT_MAXCONN)) {
 			int kill_tries = 0;
 			/*
 			 * Before creating a new connection, make sure we still
 			 * have a slot for that
 			 */
-			total_conns = srv->curr_total_conns;
+			total_conns = tsrv->curr_total_conns;
 
 			while (1) {
-				if (total_conns < srv->maxconn) {
-					if (_HA_ATOMIC_CAS(&srv->curr_total_conns,
+				if (total_conns < tsrv->maxconn) {
+					if (_HA_ATOMIC_CAS(&tsrv->curr_total_conns,
 					    &total_conns, total_conns + 1))
 						break;
 					__ha_cpu_relax();
 				} else {
-					int ret = kill_random_idle_conn(srv);
+					int ret = kill_random_idle_conn(tsrv);
 
 					/*
 					 * There is no idle connection to kill
@@ -1980,7 +1999,7 @@ int connect_server(struct stream *s)
 				}
 			}
 		}
-		srv_conn = conn_new(s->target);
+		srv_conn = conn_new(tsrv ? &tsrv->obj_type : s->target);
 		if (srv_conn) {
 			DBG_TRACE_STATE("alloc new be connection", STRM_EV_STRM_PROC|STRM_EV_CS_ST, s);
 			srv_conn->owner = s->sess;
@@ -2011,8 +2030,8 @@ int connect_server(struct stream *s)
 			}
 
 			srv_conn->hash_node.key = hash;
-		} else if (srv && (srv->flags & SRV_F_STRICT_MAXCONN))
-			_HA_ATOMIC_DEC(&srv->curr_total_conns);
+		} else if (tsrv && (tsrv->flags & SRV_F_STRICT_MAXCONN))
+			_HA_ATOMIC_DEC(&tsrv->curr_total_conns);
 	}
 
 	/* if bind_addr is non NULL free it */
@@ -2057,17 +2076,17 @@ int connect_server(struct stream *s)
 	if (!srv_conn->xprt) {
 		/* set the correct protocol on the output stream connector */
 
-		if (srv) {
-			struct protocol *proto = protocol_lookup(srv_conn->dst->ss_family, srv->addr_type.proto_type, srv->alt_proto);
+		if (tsrv) {
+			struct protocol *proto = protocol_lookup(srv_conn->dst->ss_family, tsrv->addr_type.proto_type, tsrv->alt_proto);
 #ifdef USE_OPENSSL
 			struct sample *sni_smp = NULL;
 			struct ist sni = IST_NULL;
 
 			/* Set socket SNI */
-			if (srv->xprt->get_ssl_sock_ctx && srv->ssl_ctx.sni) {
+			if (tsrv->xprt->get_ssl_sock_ctx && tsrv->ssl_ctx.sni) {
 				sni_smp = sample_fetch_as_type(s->be, s->sess, s,
 							       SMP_OPT_DIR_REQ | SMP_OPT_FINAL,
-							       srv->ssl_ctx.sni, SMP_T_STR);
+							       tsrv->ssl_ctx.sni, SMP_T_STR);
 				if (smp_make_safe(sni_smp)) {
 					sni = ist2(b_orig(&sni_smp->data.u.str), b_data(&sni_smp->data.u.str));
 					srv_conn->sni_hash = ssl_sock_sni_hash(sni);
@@ -2084,18 +2103,18 @@ int connect_server(struct stream *s)
 			 * to ensure consistency across the whole stack, in
 			 * particular for QUIC between quic-conn and mux layer.
 			 */
-			if (IS_HTX_STRM(s) && srv->use_ssl &&
-			    (srv->ssl_ctx.alpn_str || srv->ssl_ctx.npn_str)) {
-				HA_RWLOCK_RDLOCK(SERVER_LOCK, &srv->path_params.param_lock);
-				if (srv->path_params.srv_hash != hash || srv->path_params.nego_alpn[0] == 0)
+			if (IS_HTX_STRM(s) && tsrv->use_ssl &&
+			    (tsrv->ssl_ctx.alpn_str || tsrv->ssl_ctx.npn_str)) {
+				HA_RWLOCK_RDLOCK(SERVER_LOCK, &tsrv->path_params.param_lock);
+				if (tsrv->path_params.srv_hash != hash || tsrv->path_params.nego_alpn[0] == 0)
 					may_start_mux_now = 0;
-				HA_RWLOCK_RDUNLOCK(SERVER_LOCK, &srv->path_params.param_lock);
+				HA_RWLOCK_RDUNLOCK(SERVER_LOCK, &tsrv->path_params.param_lock);
 			}
 #endif /* TLSEXT_TYPE_application_layer_protocol_negotiation */
 
 #endif /* USE_OPENSSL */
 
-			if (conn_prepare(srv_conn, proto, srv->xprt)) {
+			if (conn_prepare(srv_conn, proto, tsrv->xprt)) {
 				conn_free(srv_conn);
 				return SF_ERR_INTERNAL;
 			}
@@ -2128,12 +2147,12 @@ int connect_server(struct stream *s)
 		/* process the case where the server requires the PROXY protocol to be sent */
 		srv_conn->send_proxy_ofs = 0;
 
-		if (srv && (srv->pp_opts & SRV_PP_ENABLED)) {
+		if (tsrv && (tsrv->pp_opts & SRV_PP_ENABLED)) {
 			srv_conn->flags |= CO_FL_SEND_PROXY;
 			srv_conn->send_proxy_ofs = 1; /* must compute size */
 		}
 
-		if (srv && (srv->flags & SRV_F_SOCKS4_PROXY)) {
+		if (tsrv && (tsrv->flags & SRV_F_SOCKS4_PROXY)) {
 			srv_conn->send_proxy_ofs = 1;
 			srv_conn->flags |= CO_FL_SOCKS4;
 		}
@@ -2148,11 +2167,11 @@ int connect_server(struct stream *s)
 #if defined(USE_OPENSSL) && defined(TLSEXT_TYPE_application_layer_protocol_negotiation)
 		/* if websocket stream, try to update connection ALPN. */
 		if (unlikely(s->flags & SF_WEBSOCKET) &&
-		    srv && srv->use_ssl && srv->ssl_ctx.alpn_str) {
+		    tsrv && tsrv->use_ssl && tsrv->ssl_ctx.alpn_str) {
 			char *alpn = "";
 			int force = 0;
 
-			switch (srv->ws) {
+			switch (tsrv->ws) {
 			case SRV_WS_AUTO:
 				alpn = "\x08http/1.1";
 				force = 0;
@@ -2225,7 +2244,7 @@ int connect_server(struct stream *s)
 	 */
 	if (may_start_mux_now) {
 		const struct mux_ops *alt_mux =
-		  likely(!(s->flags & SF_WEBSOCKET) || !srv) ? NULL : srv_get_ws_proto(srv);
+		  likely(!(s->flags & SF_WEBSOCKET) || !tsrv) ? NULL : srv_get_ws_proto(tsrv);
 		if (conn_install_mux_be(srv_conn, s->scb, s->sess, alt_mux) < 0) {
 			conn_full_close(srv_conn);
 			return SF_ERR_INTERNAL;
@@ -2239,10 +2258,10 @@ int connect_server(struct stream *s)
 			 * protocol supports multiplexing, add it in the
 			 * session server list.
 			 */
-			if (srv && reuse_mode == PR_O_REUSE_ALWS &&
+			if (tsrv && reuse_mode == PR_O_REUSE_ALWS &&
 			    !(srv_conn->flags & CO_FL_PRIVATE) &&
 			    srv_conn->mux->avail_streams(srv_conn) > 0) {
-				srv_add_to_avail_list(srv, srv_conn);
+				srv_add_to_avail_list(tsrv, srv_conn);
 			}
 			else if (srv_conn->flags & CO_FL_PRIVATE ||
 			         (reuse_mode == PR_O_REUSE_SAFE &&
@@ -2798,8 +2817,19 @@ void back_handle_st_cer(struct stream *s)
 	/* we probably have to release last stream from the server */
 	if (objt_server(s->target)) {
 		struct connection *conn = sc_conn(sc);
+		struct server *srv = __objt_server(s->target);
 
-		health_adjust(__objt_server(s->target), HANA_STATUS_L4_ERR);
+		health_adjust(srv, HANA_STATUS_L4_ERR);
+
+		/* feed the transport failover state machine with this failure,
+		 * telling apart a really broken transport from a local or
+		 * session specific problem.
+		 */
+		if (srv->flags & SRV_F_TF_ENABLED) {
+			srv_tf_report_conn_err(srv,
+			                       conn ? objt_server(conn->target) : NULL,
+			                       srv_tf_classify_conn_err(conn, s));
+		}
 
 		if (s->flags & SF_CURR_SESS) {
 			s->flags &= ~SF_CURR_SESS;
