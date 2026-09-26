@@ -495,6 +495,13 @@ enum stat_idx_px {
 	ST_I_PX_REQ_OUT,
 	ST_I_PX_RES_IN,
 	ST_I_PX_RES_OUT,
+	ST_I_PX_TF_CURRENT,
+	ST_I_PX_TF_STATE,
+	ST_I_PX_TF_FB_ACTIVE,
+	ST_I_PX_TF_SWITCHES,
+	ST_I_PX_TF_FB_CONNS,
+	ST_I_PX_TF_PRIM_FAIL,
+	ST_I_PX_TF_RECOV,
 	/* must always be the last one */
 	ST_I_PX_MAX
 };

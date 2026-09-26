@@ -16,6 +16,7 @@
 #include <haproxy/stats.h>
 #include <haproxy/stats-html.h>
 #include <haproxy/server.h>
+#include <haproxy/server_tf.h>
 #include <haproxy/stconn.h>
 #include <haproxy/time.h>
 #include <haproxy/tools.h>
@@ -196,6 +197,16 @@ const struct stat_col stat_cols_px[ST_I_PX_MAX] = {
 	[ST_I_PX_REQ_OUT]       = ME_NEW_PX_SHARED("reqbout",       "req_bytes_out_total",           FN_COUNTER, FF_U64, req_out,              STATS_PX_CAP_LFBS, "Total number of request bytes sent since process started"),
 	[ST_I_PX_RES_IN]        = ME_NEW_PX_SHARED("resbin",        "res_bytes_in_total",            FN_COUNTER, FF_U64, res_in,               STATS_PX_CAP_LFBS, "Total number of response bytes received since process started"),
 	[ST_I_PX_RES_OUT]       = ME_NEW_PX_SHARED("resbout",       "res_bytes_out_total",           FN_COUNTER, FF_U64, res_out,              STATS_PX_CAP_LFBS, "Total number of response bytes sent since process started"),
+	/* the two fields below are textual, they are not exported to Prometheus
+	 * which gets the numeric "fallback_transport_active" gauge instead.
+	 */
+	[ST_I_PX_TF_CURRENT]                    = { .name = "transport_current",           .alt_name = NULL,                              .desc = "Transport currently used for new connections (primary or fallback)", .cap = STATS_PX_CAP____S},
+	[ST_I_PX_TF_STATE]                      = { .name = "transport_state",             .alt_name = NULL,                              .desc = "State of the transport failover state machine", .cap = STATS_PX_CAP____S},
+	[ST_I_PX_TF_FB_ACTIVE]                  = { .name = "transport_fb_active",         .alt_name = "fallback_transport_active",       .desc = "1 if new connections currently use the fallback transport", .cap = STATS_PX_CAP____S},
+	[ST_I_PX_TF_SWITCHES]                   = { .name = "transport_switches",          .alt_name = "transport_switches_total",        .desc = "Total number of transport transitions", .cap = STATS_PX_CAP____S},
+	[ST_I_PX_TF_FB_CONNS]                   = { .name = "transport_fb_conns",          .alt_name = "fallback_transport_connections_total", .desc = "Total number of connections started on the fallback transport", .cap = STATS_PX_CAP____S},
+	[ST_I_PX_TF_PRIM_FAIL]                  = { .name = "transport_prim_failures",     .alt_name = "primary_transport_failures_total",.desc = "Total number of primary transport failures observed", .cap = STATS_PX_CAP____S},
+	[ST_I_PX_TF_RECOV]                      = { .name = "transport_recov_attempts",    .alt_name = "transport_recovery_attempts_total", .desc = "Total number of primary transport recovery attempts", .cap = STATS_PX_CAP____S},
 
 };
 
@@ -1038,6 +1049,34 @@ int stats_fill_sv_line(struct proxy *px, struct server *sv, int flags,
 			case ST_I_PX_AGENT_HEALTH:
 				if ((sv->agent.state & (CHK_ST_ENABLED|CHK_ST_PAUSED)) == CHK_ST_ENABLED)
 					field = mkf_u32(FO_CONFIG|FS_SERVICE, sv->agent.health);
+				break;
+			case ST_I_PX_TF_CURRENT:
+				if (sv->flags & SRV_F_TF_ENABLED)
+					field = mkf_str(FO_STATUS, srv_tf_on_fallback(sv) ? "fallback" : "primary");
+				break;
+			case ST_I_PX_TF_STATE:
+				if (sv->flags & SRV_F_TF_ENABLED)
+					field = mkf_str(FO_STATUS, srv_tf_state_str(HA_ATOMIC_LOAD(&sv->tf.state)));
+				break;
+			case ST_I_PX_TF_FB_ACTIVE:
+				if (sv->flags & SRV_F_TF_ENABLED)
+					field = mkf_u32(FN_GAUGE, !!srv_tf_on_fallback(sv));
+				break;
+			case ST_I_PX_TF_SWITCHES:
+				if (sv->flags & SRV_F_TF_ENABLED)
+					field = mkf_u32(FN_COUNTER, HA_ATOMIC_LOAD(&sv->tf.switches));
+				break;
+			case ST_I_PX_TF_FB_CONNS:
+				if (sv->flags & SRV_F_TF_ENABLED)
+					field = mkf_u32(FN_COUNTER, HA_ATOMIC_LOAD(&sv->tf.fb_conns));
+				break;
+			case ST_I_PX_TF_PRIM_FAIL:
+				if (sv->flags & SRV_F_TF_ENABLED)
+					field = mkf_u32(FN_COUNTER, HA_ATOMIC_LOAD(&sv->tf.prim_fail));
+				break;
+			case ST_I_PX_TF_RECOV:
+				if (sv->flags & SRV_F_TF_ENABLED)
+					field = mkf_u32(FN_COUNTER, HA_ATOMIC_LOAD(&sv->tf.recov));
 				break;
 			case ST_I_PX_QTIME:
 				field = mkf_u32(FN_AVG, swrate_avg(sv->counters.q_time, srv_samples_window));

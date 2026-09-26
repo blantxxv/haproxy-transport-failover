@@ -33,6 +33,7 @@
 #include <haproxy/sample.h>
 #include <haproxy/sc_strm.h>
 #include <haproxy/server.h>
+#include <haproxy/server_tf.h>
 #include <haproxy/stats.h>
 #include <haproxy/stconn.h>
 #include <haproxy/stream.h>
@@ -1281,6 +1282,17 @@ static int promex_dump_srv_metrics(struct appctx *appctx, struct htx *htx)
 						}
 						ctx->obj_state = 0;
 						goto next_sv;
+					case ST_I_PX_TF_FB_ACTIVE:
+					case ST_I_PX_TF_SWITCHES:
+					case ST_I_PX_TF_FB_CONNS:
+					case ST_I_PX_TF_PRIM_FAIL:
+					case ST_I_PX_TF_RECOV:
+						/* only reported for servers configured with a
+						 * fallback transport, others have no such value.
+						 */
+						if (!(sv->flags & SRV_F_TF_ENABLED))
+							goto next_sv;
+						break;
 					case ST_I_PX_QTIME:
 						secs = (double)swrate_avg(sv->counters.q_time, TIME_STATS_SAMPLES) / 1000.0;
 						val = mkf_flt(FN_AVG, secs);
