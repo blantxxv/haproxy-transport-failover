@@ -57,6 +57,7 @@
 #include <haproxy/quic_tp.h>
 #include <haproxy/quic_tune.h>
 #include <haproxy/server-t.h>
+#include <haproxy/server_tf.h>
 #include <haproxy/signal.h>
 #include <haproxy/stats.h>
 #include <haproxy/stconn.h>
@@ -94,6 +95,7 @@ struct show_srv_ctx {
 	struct server *sv;      /* current server to dump or NULL */
 	uint only_pxid;         /* dump only this proxy ID when explicit */
 	int show_conn;          /* non-zero = "conn" otherwise "state" */
+	int show_transport;     /* non-zero = "transport" */
 	enum {
 		SHOW_SRV_HEAD = 0,
 		SHOW_SRV_LIST,
@@ -2640,6 +2642,13 @@ int proxy_finalize(struct proxy *px, int *err_code)
 			}
 		}
 
+		if (newsrv->tf.fb_name) {
+			if (srv_tf_init(newsrv, px)) {
+				++cfgerr;
+				goto next_srv;
+			}
+		}
+
 	next_srv:
 		reset_usermsgs_ctx();
 		newsrv = newsrv->next;
@@ -4486,7 +4495,8 @@ static int cli_parse_show_servers(char **args, char *payload, struct appctx *app
 	struct show_srv_ctx *ctx = applet_reserve_svcctx(appctx, sizeof(*ctx));
 	struct proxy *px;
 
-	ctx->show_conn = *args[2] == 'c'; // "conn" vs "state"
+	ctx->show_conn = *args[2] == 'c';      // "conn" vs "state"
+	ctx->show_transport = *args[2] == 't'; // "transport"
 
 	watcher_init(&ctx->px_watch,  &ctx->px, offsetof(struct proxy,  watcher_list));
 	watcher_init(&ctx->srv_watch, &ctx->sv, offsetof(struct server, watcher_list));
@@ -4558,7 +4568,17 @@ static int dump_servers_state(struct appctx *appctx)
 		if (srv->srvrq && srv->srvrq->name)
 			srvrecord = srv->srvrq->name;
 
-		if (ctx->show_conn == 0) {
+		if (ctx->show_transport) {
+			/* show servers transport : only servers configured with
+			 * a fallback transport are of interest here.
+			 */
+			if (!(srv->flags & SRV_F_TF_ENABLED))
+				continue;
+
+			chunk_reset(&trash);
+			srv_tf_dump(&trash, srv);
+		}
+		else if (ctx->show_conn == 0) {
 			/* show servers state */
 			chunk_printf(&trash,
 			             "%d %s "
@@ -4617,7 +4637,12 @@ static int cli_io_handler_servers_state(struct appctx *appctx)
 	struct proxy *curproxy;
 
 	if (ctx->state == SHOW_SRV_HEAD) {
-		if (ctx->show_conn == 0)
+		if (ctx->show_transport)
+			chunk_printf(&trash,
+			             "# bkname/svname bkid/svid state= current= primary= fallback= "
+			             "fail=cur/thres rise=cur/thres fb_fail= switches= fb_conns= "
+			             "prim_fail= recov= probe= hold= last_change= reason=\n");
+		else if (ctx->show_conn == 0)
 			chunk_printf(&trash, "%d\n# %s\n", SRV_STATE_FILE_VERSION, SRV_STATE_FILE_FIELD_NAMES);
 		else
 			chunk_printf(&trash,
@@ -5541,6 +5566,7 @@ static struct cli_kw_list cli_kws = {{ },{
 	{ { "set", "maxconn", "frontend",  NULL },          "set maxconn frontend <frontend> <value> : change a frontend's maxconn setting",                            cli_parse_set_maxconn_frontend, NULL },
 	{ { "show","servers", "conn",  NULL },              "show servers conn [<backend>]           : dump server connections status (all or for a single backend)",   cli_parse_show_servers, cli_io_handler_servers_state, cli_io_release_show_servers, },
 	{ { "show","servers", "state",  NULL },             "show servers state [<backend>]          : dump volatile server information (all or for a single backend)", cli_parse_show_servers, cli_io_handler_servers_state, cli_io_release_show_servers, },
+	{ { "show","servers", "transport",  NULL },         "show servers transport [<backend>]      : dump transport failover state of servers using a fallback transport", cli_parse_show_servers, cli_io_handler_servers_state, cli_io_release_show_servers, },
 	{ { "show", "backend", NULL },                      "show backend                            : list backends in the current running config",                    NULL, cli_io_handler_show_backend, cli_io_release_show_backend, },
 	{ { "shutdown", "frontend",  NULL },                "shutdown frontend <frontend>            : stop a specific frontend",                                       cli_parse_shutdown_frontend, NULL, NULL },
 	{ { "set", "dynamic-cookie-key", "backend", NULL }, "set dynamic-cookie-key backend <bk> <k> : change a backend secret key for dynamic cookies",                cli_parse_set_dyncookie_key_backend, NULL },
